@@ -1,0 +1,6 @@
+data/
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+.backup-double-entry/
+*.db

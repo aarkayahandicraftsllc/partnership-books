@@ -1,0 +1,12 @@
+[server]
+headless = true
+maxUploadSize = 50
+# CORS and XSRF protection are left at their defaults (on). Streamlit warns
+# that turning CORS off would accept a WebSocket from any origin, which is not
+# something you want in front of your accounts.
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "light"
