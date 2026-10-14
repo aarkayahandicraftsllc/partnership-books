@@ -1130,6 +1130,13 @@ def backup_bytes() -> bytes:
 
 
 def _parse_backup(raw: bytes) -> dict:
+    if raw[:15] == b"SQLite format 3":
+        raise ValueError(
+            "That is a raw SQLite database, not a backup file. Older versions "
+            "of this app downloaded backups in that format. Take a fresh "
+            "backup from Setup — the current format is a small .gz file "
+            "(a couple of KB, not tens of KB)."
+        )
     try:
         gzipped = raw[:2] == bytes((0x1F, 0x8B))
         decoded = gzip.decompress(raw) if gzipped else raw

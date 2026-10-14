@@ -1446,8 +1446,11 @@ with tab_setup:
             "Restoring **replaces everything** currently in the app. The books "
             "being replaced are copied aside first, next to the data file."
         )
+        # some browsers strip the .gz when they decompress on download, so
+        # accept the bare name too
         uploaded = st.file_uploader("Backup file (.books.gz)",
-                                    type=["gz", "json"], key="restore_file")
+                                    type=["gz", "books", "json"],
+                                    key="restore_file")
         if uploaded is not None:
             raw = uploaded.getvalue()
             try:
