@@ -43,6 +43,9 @@ from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
+from functools import wraps
+import copy
+
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -267,7 +270,13 @@ def engine():
 
 
 def reset_engine() -> None:
-    """Drop pooled connections — used after switching or restoring a database."""
+    """Drop pooled connections — used after switching or restoring a database.
+
+    Also forgets that the schema was initialised and empties the read cache:
+    the next call is pointing at a different database.
+    """
+    _schema_ready.clear()
+    clear_read_cache()
     for existing in _engines.values():
         try:
             existing.dispose()
@@ -311,6 +320,7 @@ class Connection:
 
     def __init__(self, raw):
         self.raw = raw
+        self.wrote = False
 
     @staticmethod
     def _bind(sql: str, params):
@@ -326,10 +336,14 @@ class Connection:
         return text(_QUESTION_MARK.sub(swap, sql)), dict(zip(names, params))
 
     def execute(self, sql: str, params=()):
+        if _is_write(sql):
+            self.wrote = True
         statement, bound = self._bind(sql, params)
         return Cursor(self.raw.execute(statement, bound))
 
     def executemany(self, sql: str, rows) -> None:
+        if _is_write(sql):
+            self.wrote = True
         rows = list(rows)
         if not rows:
             return
@@ -340,6 +354,7 @@ class Connection:
         )
 
     def executescript(self, script: str) -> None:
+        self.wrote = True
         for statement in _split_statements(script):
             self.raw.execute(text(statement))
 
@@ -353,6 +368,70 @@ def _split_statements(script: str) -> list[str]:
     return [chunk.strip() for chunk in script.split(";") if chunk.strip()]
 
 
+# --------------------------------------------------------------------------- #
+# request-scoped read cache
+#
+# Streamlit re-executes the whole script on every interaction, and st.tabs
+# renders every tab body whether or not it is the visible one. The app was
+# therefore asking for the same reference rows dozens of times per rerun - 24
+# reads of a single setting, 21 of the currency table - and on a hosted
+# Postgres each one is a network round trip.
+#
+# These reads are memoised for the life of a rerun. Correctness comes from
+# invalidation being automatic rather than remembered: _mark_write below
+# notices any INSERT/UPDATE/DELETE/DDL and the commit that follows empties the
+# cache, so a cached value cannot survive a change to the data it came from.
+# --------------------------------------------------------------------------- #
+_read_cache: dict = {}
+_cache_enabled = False
+
+
+def enable_read_cache(enabled: bool = True) -> None:
+    """Turn the memo on (the app does this once at the top of a rerun)."""
+    global _cache_enabled
+    _cache_enabled = enabled
+    _read_cache.clear()
+
+
+def clear_read_cache() -> None:
+    _read_cache.clear()
+
+
+def cached_read(func):
+    """Memoise a read for the rest of this rerun, keyed on its arguments."""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        if not _cache_enabled:
+            return func(*args, **kwargs)
+        try:
+            key = (func.__name__, args, tuple(sorted(kwargs.items())))
+            hash(key)
+        except TypeError:
+            # an unhashable argument (a DataFrame, a list) - just do the read
+            return func(*args, **kwargs)
+        if key not in _read_cache:
+            _read_cache[key] = func(*args, **kwargs)
+        value = _read_cache[key]
+        # Hand back a copy of a frame: callers mutate what they are given, and
+        # a shared cached frame would carry those edits to the next caller.
+        if isinstance(value, pd.DataFrame):
+            return value.copy()
+        if isinstance(value, (dict, list)) and not isinstance(value, Row):
+            return copy.copy(value)
+        return value
+
+    wrapper.__wrapped__ = func
+    return wrapper
+
+
+_WRITE_VERBS = ("INSERT", "UPDATE", "DELETE", "REPLACE", "CREATE", "DROP",
+                "ALTER", "TRUNCATE")
+
+
+def _is_write(sql: str) -> bool:
+    return str(sql).lstrip().upper().startswith(_WRITE_VERBS)
+
+
 @contextmanager
 def connect():
     """A transaction. Commits on success, rolls back on any exception."""
@@ -363,6 +442,9 @@ def connect():
         try:
             yield wrapper
             raw.commit()
+            if wrapper.wrote:
+                # the data moved, so nothing memoised about it can be trusted
+                clear_read_cache()
         except Exception:
             raw.rollback()
             raise
@@ -447,7 +529,25 @@ def _allow_negative_expenses() -> None:
             )
 
 
-def init_db() -> None:
+_schema_ready: set = set()
+
+
+def init_db(force: bool = False) -> None:
+    """Create or migrate the schema.
+
+    Cheap on SQLite, but on a hosted Postgres it was costing a dozen round
+    trips on every rerun to re-check a schema that cannot have changed. Once a
+    URL has been initialised in this process we skip it; reset_engine() forgets
+    that, so switching or restoring a database still re-runs it.
+    """
+    key = f"{database_url()}#{os.environ.get('BOOKS_PG_SCHEMA', '').strip()}"
+    if not force and key in _schema_ready:
+        return
+    _init_db_impl()
+    _schema_ready.add(key)
+
+
+def _init_db_impl() -> None:
     """Create the schema and seed first-run defaults. Safe to call repeatedly."""
     with connect() as conn:
         conn.executescript(SCHEMA.format(**DDL_TYPES[dialect()]))
@@ -502,6 +602,7 @@ def init_db() -> None:
 # --------------------------------------------------------------------------- #
 # settings
 # --------------------------------------------------------------------------- #
+@cached_read
 def get_setting(key: str, default: str = "") -> str:
     with connect() as conn:
         row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
@@ -520,10 +621,12 @@ def set_setting(key: str, value: str) -> None:
 # --------------------------------------------------------------------------- #
 # currencies
 # --------------------------------------------------------------------------- #
+@cached_read
 def base_currency() -> str:
     return get_setting("base_currency", "INR")
 
 
+@cached_read
 def get_currencies() -> pd.DataFrame:
     with connect() as conn:
         return conn.read_sql(
@@ -531,6 +634,7 @@ def get_currencies() -> pd.DataFrame:
         )
 
 
+@cached_read
 def rate_map() -> dict[str, float]:
     """{currency code: how many base-currency units one unit is worth}."""
     cur = get_currencies()
@@ -539,11 +643,13 @@ def rate_map() -> dict[str, float]:
     return rates
 
 
+@cached_read
 def symbol_map() -> dict[str, str]:
     cur = get_currencies()
     return dict(zip(cur["code"], cur["symbol"]))
 
 
+@cached_read
 def default_currency(kind: str) -> str:
     """Which currency the entry form should pre-select for this kind of entry.
 
@@ -636,6 +742,7 @@ def set_base_currency(code: str) -> None:
 # --------------------------------------------------------------------------- #
 # partners
 # --------------------------------------------------------------------------- #
+@cached_read
 def get_partners(include_inactive: bool = False) -> pd.DataFrame:
     sql = "SELECT * FROM partners"
     if not include_inactive:
@@ -677,6 +784,7 @@ def update_partner(partner_id: int, name: str, expense_pct: float,
         )
 
 
+@cached_read
 def ratio_totals() -> dict[str, float]:
     """Sum of each ratio column across active, non-firm partners."""
     sharing = get_partners()
@@ -710,6 +818,7 @@ def delete_partner(partner_id: int) -> None:
 # --------------------------------------------------------------------------- #
 # categories
 # --------------------------------------------------------------------------- #
+@cached_read
 def get_categories(kind: str) -> list[str]:
     with connect() as conn:
         rows = conn.execute(
@@ -1073,6 +1182,7 @@ def add_settlement(paid_on, from_id: int, to_id: int, amount: float,
         )
 
 
+@cached_read
 def get_settlements() -> pd.DataFrame:
     sql = (
         "SELECT s.*, pf.name AS from_name, pt.name AS to_name FROM settlements s"

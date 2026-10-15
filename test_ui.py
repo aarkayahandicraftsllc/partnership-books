@@ -323,4 +323,26 @@ for choice in ("This financial year", "This month", "Since the beginning"):
     assert not at5.exception, (choice, at5.exception)
 print("PASS  every trial-balance period renders")
 
+# A fresh income entry should land on Sales, not on whatever sorts first
+# alphabetically. Expense keeps the first category, so check both: the point
+# is that flipping the kind re-applies that kind's default rather than holding
+# on to the other kind's pick.
+fresh = AppTest.from_file(str(APP), default_timeout=60).run()
+assert not fresh.exception, fresh.exception
+
+
+def category_value(at_):
+    return next(s for s in at_.selectbox if s.label == "Category").value
+
+
+assert category_value(fresh) == db.get_categories("expense")[0], category_value(fresh)
+print(f"PASS  a new expense starts on {category_value(fresh)!r}")
+
+kind_radio = next(r for r in fresh.radio if r.options and "Income" in r.options)
+fresh = kind_radio.set_value("Income").run()
+assert not fresh.exception, fresh.exception
+assert category_value(fresh) == "Sales", category_value(fresh)
+print(f"PASS  a new income starts on {category_value(fresh)!r}, "
+      f"not {db.get_categories('income')[0]!r}")
+
 print("\nALL UI CHECKS PASSED")

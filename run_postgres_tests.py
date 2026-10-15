@@ -22,7 +22,7 @@ from pathlib import Path
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 SUITES = ["test_books.py", "test_migration.py", "test_statements.py",
-          "test_ui.py", "test_deploy.py"]
+          "test_ui.py", "test_deploy.py", "test_cache.py"]
 HERE = Path(__file__).resolve().parent
 
 # test_migration builds an old-schema SQLite file by hand, so it only ever

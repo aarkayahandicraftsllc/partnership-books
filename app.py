@@ -83,6 +83,13 @@ def require_password() -> None:
 bridge_secrets()
 require_password()
 
+# Streamlit re-runs this script from the top on every interaction, and renders
+# every tab body rather than just the visible one, so the same reference rows
+# were being read dozens of times per rerun - 334 round trips to a hosted
+# database for one click. Memoise reads for the life of this rerun; db clears
+# the memo the moment anything is written, so nothing stale can be displayed.
+db.enable_read_cache()
+
 try:
     db.init_db()
 except Exception as exc:  # a hosted database that cannot be reached
@@ -120,6 +127,11 @@ SYMBOLS = db.symbol_map()
 RATES = db.rate_map()
 BASE_SYMBOL = SYMBOLS.get(BASE, BASE)
 DEFAULT_CURRENCY = {kind: db.default_currency(kind) for kind in db.RATIO_COLUMN}
+# Where a fresh entry's Category lands. Without this the box opens on whatever
+# sorts first alphabetically, which for income is Commission rather than the
+# one nearly every income line uses. Falls back to the first category if the
+# named one has been renamed or removed.
+DEFAULT_CATEGORY = {"income": "Sales"}
 BUSINESS = db.get_setting("business_name", "My Partnership")
 FY_START_MONTH = int(db.get_setting("fy_start_month", "4"))
 
@@ -323,10 +335,14 @@ def entry_editor(prefix: str, partners: pd.DataFrame, existing: dict | None = No
         existing_cat = (existing or {}).get("category", "")
         if existing_cat and existing_cat not in cats:
             cats = [existing_cat] + cats
+        default_cat = existing_cat or DEFAULT_CATEGORY.get(kind, "")
         category = st.selectbox(
             "Category", cats + ["➕ New category…"],
-            index=cats.index(existing_cat) if existing_cat in cats else 0,
-            key=k("cat"),
+            index=cats.index(default_cat) if default_cat in cats else 0,
+            # the kind is part of the key for the same reason as the currency
+            # above: flipping Expense/Income should re-apply that kind's
+            # default rather than hold on to the category picked for the other
+            key=k(f"cat_{kind}"),
         )
         if category == "➕ New category…":
             category = st.text_input("New category name", key=k("newcat")).strip()
