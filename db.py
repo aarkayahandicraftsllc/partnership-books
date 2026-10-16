@@ -880,6 +880,94 @@ def resolve_split(
             for r in sharing.itertuples()}
 
 
+def _prepare_entry(*, entry_date, kind: str, amount: float, category: str,
+                   description: str, cash_partner_id: int, share_mode: str,
+                   currency: str | None, custom_split: dict[int, float] | None
+                   ) -> dict:
+    """Check one line and work out its split, touching nothing.
+
+    Pulled out of save_entry so a batch can validate every line BEFORE the
+    first insert: a form of several lines should be refused whole rather than
+    leaving half of it in the books.
+    """
+    if share_mode not in SHARE_MODES:
+        raise ValueError(f"Unknown share mode {share_mode!r}")
+    if float(amount) == 0:
+        raise ValueError("Amount cannot be zero.")
+    if float(amount) < 0 and kind not in NEGATIVE_KINDS:
+        raise ValueError(
+            "Only expenses can be negative — use a negative expense for a refund "
+            "or credit note."
+        )
+
+    code = (currency or base_currency()).strip().upper()
+    if code not in rate_map():
+        raise ValueError(f"Unknown currency {code!r} — add it in Setup first.")
+
+    return {
+        "entry_date": (entry_date.isoformat() if hasattr(entry_date, "isoformat")
+                       else str(entry_date)),
+        "kind": kind,
+        "amount": float(amount),
+        "currency": code,
+        "category": category.strip(),
+        "description": description.strip(),
+        "cash_partner_id": int(cash_partner_id),
+        "share_mode": share_mode,
+        "splits": resolve_split(share_mode, cash_partner_id, custom_split, kind=kind),
+    }
+
+
+def save_entries(lines: list[dict]) -> list[int]:
+    """Save several lines as separate entries, in one transaction.
+
+    Every line is checked first, so a bad line stops the lot before anything
+    is written — no half-saved form to unpick. One transaction also means one
+    round trip's worth of overhead instead of one per line, which matters on a
+    hosted database.
+
+    Each line is a dict of the same arguments save_entry takes, minus
+    entry_id: this inserts, it never updates.
+    """
+    if not lines:
+        return []
+
+    prepared = []
+    for position, line in enumerate(lines, start=1):
+        try:
+            prepared.append(_prepare_entry(
+                entry_date=line["entry_date"], kind=line["kind"],
+                amount=line["amount"], category=line.get("category", ""),
+                description=line.get("description", ""),
+                cash_partner_id=line["cash_partner_id"],
+                share_mode=line["share_mode"],
+                currency=line.get("currency"),
+                custom_split=line.get("custom_split"),
+            ))
+        except (ValueError, KeyError) as exc:
+            raise ValueError(f"Line {position}: {exc}") from exc
+
+    ids: list[int] = []
+    with connect() as conn:
+        for row in prepared:
+            cur = conn.execute(
+                "INSERT INTO entries (entry_date, kind, amount, currency, category,"
+                " description, cash_partner_id, share_mode, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                (row["entry_date"], row["kind"], row["amount"], row["currency"],
+                 row["category"], row["description"], row["cash_partner_id"],
+                 row["share_mode"], _now()),
+            )
+            new_id = int(cur.fetchone()[0])
+            ids.append(new_id)
+            conn.executemany(
+                "INSERT INTO entry_splits (entry_id, partner_id, pct)"
+                " VALUES (?, ?, ?)",
+                [(new_id, pid, pct) for pid, pct in row["splits"].items()],
+            )
+    return ids
+
+
 def save_entry(
     *,
     entry_date,
@@ -898,22 +986,17 @@ def save_entry(
     Expenses may be negative — that is how you record a refund, a credit note
     or a correction. Income must be positive.
     """
-    if share_mode not in SHARE_MODES:
-        raise ValueError(f"Unknown share mode {share_mode!r}")
-    if float(amount) == 0:
-        raise ValueError("Amount cannot be zero.")
-    if float(amount) < 0 and kind not in NEGATIVE_KINDS:
-        raise ValueError(
-            "Only expenses can be negative — use a negative expense for a refund "
-            "or credit note."
-        )
-
-    code = (currency or base_currency()).strip().upper()
-    if code not in rate_map():
-        raise ValueError(f"Unknown currency {code!r} — add it in Setup first.")
-
-    splits = resolve_split(share_mode, cash_partner_id, custom_split, kind=kind)
-    date_str = entry_date.isoformat() if hasattr(entry_date, "isoformat") else str(entry_date)
+    prepared = _prepare_entry(
+        entry_date=entry_date, kind=kind, amount=amount, category=category,
+        description=description, cash_partner_id=cash_partner_id,
+        share_mode=share_mode, currency=currency, custom_split=custom_split,
+    )
+    code = prepared["currency"]
+    splits = prepared["splits"]
+    date_str = prepared["entry_date"]
+    category = prepared["category"]
+    description = prepared["description"]
+    amount = prepared["amount"]
 
     with connect() as conn:
         if entry_id is None:

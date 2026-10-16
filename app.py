@@ -458,6 +458,236 @@ def entry_editor(prefix: str, partners: pd.DataFrame, existing: dict | None = No
 
 
 # --------------------------------------------------------------------------- #
+# several lines at once
+#
+# The header fields are entered once; the grid holds one row per amount, each
+# with its own sharing choice. Every row is saved as its own entry, which is
+# what the schema already models - one amount per entry, with its own split -
+# so the Ledger and the statements need no changes to understand them.
+# --------------------------------------------------------------------------- #
+SHARE_GRID_LABELS = {"Ratio": "ratio", "Custom": "custom", "Not shared": "none"}
+
+
+def effective_pct(mode: str, cash_partner_id: int, typed: dict[int, float],
+                  partners: pd.DataFrame, kind: str,
+                  sharer_ids: list[int]) -> dict[int, float]:
+    """What each partner's percentage really is for one grid row.
+
+    The grid's percentage columns are an input only for Custom rows. For Ratio
+    and Not shared the figures are worked out, so showing anything else - the
+    ratio against a Not shared row, say - states a split that will not be
+    used. This returns what db.resolve_split will actually apply, so the grid
+    can show that instead.
+    """
+    if mode == "custom":
+        return {pid: float(typed.get(pid, 0.0) or 0.0) for pid in sharer_ids}
+    try:
+        resolved = db.resolve_split(mode, int(cash_partner_id), None,
+                                    partners, kind=kind)
+    except ValueError:
+        return {pid: 0.0 for pid in sharer_ids}
+    # Not shared can land on the firm, which has no column of its own; such a
+    # row simply shows zero against every sharer, which is the truth.
+    # round: resolve_split normalises, which can leave 55.00000000000001
+    return {pid: round(float(resolved.get(pid, 0.0)), 2) for pid in sharer_ids}
+
+
+def multi_entry_form(partners: pd.DataFrame) -> None:
+    n = nonce("multi")
+    k = lambda name: f"multi_{name}_{n}"  # noqa: E731
+
+    ids = [int(i) for i in partners["id"]]
+    names = dict(zip(partners["id"].astype(int), partners["name"]))
+    sharers = partners[partners["is_firm"] == 0]
+    pct_columns = {int(r.id): f"{r.name} %" for r in sharers.itertuples()}
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        kind = st.radio("Type", ["expense", "income"], format_func=str.capitalize,
+                        horizontal=True, key=k("kind"))
+        entry_date = st.date_input("Date", value=date.today(),
+                                   format="DD/MM/YYYY", key=k("date"))
+    with c2:
+        codes = list(RATES)
+        default_code = DEFAULT_CURRENCY[kind]
+        currency = st.selectbox(
+            "Currency", codes,
+            index=codes.index(default_code) if default_code in codes else 0,
+            key=k(f"cur_{kind}"),
+        )
+        cash_label = "Paid by" if kind == "expense" else "Received by"
+        cash_partner_id = st.selectbox(
+            cash_label, ids, format_func=lambda i: names[i], key=k("cash"),
+            help="Whose pocket or account the money actually moved through. "
+                 "It applies to every line below.",
+        )
+    with c3:
+        cats = db.get_categories(kind)
+        default_cat = DEFAULT_CATEGORY.get(kind, "")
+        category = st.selectbox(
+            "Category", cats,
+            index=cats.index(default_cat) if default_cat in cats else 0,
+            key=k(f"cat_{kind}"),
+        )
+        description = st.text_input("Description / notes", key=k("desc"))
+
+    # expense_pct for expenses, profit_pct for income
+    ratio_column = db.RATIO_COLUMN[kind]
+    ratio_hint = " / ".join(
+        f"{r.name} {getattr(r, ratio_column):g}%" for r in sharers.itertuples()
+    ) or "no ratios set"
+    st.caption(
+        f"One row per amount. **Ratio** uses the {ratio_hint} split, "
+        f"**Custom** uses the per-partner percentages on that row (they must "
+        f"total 100), **Not shared** puts the whole line on "
+        f"{names.get(cash_partner_id, '?')}. Blank rows are ignored."
+    )
+
+    # The grid is rebuilt from what it held last run, with the percentage
+    # columns recomputed from each row's Sharing choice: Ratio shows the Setup
+    # ratio, Not shared shows the whole line on whoever handled the cash, and
+    # Custom keeps whatever was typed.
+    #
+    # The widget key carries a fingerprint of the Sharing column. Editing an
+    # amount leaves the fingerprint alone, so Streamlit's own edit tracking
+    # handles it; changing a Sharing cell changes the key, which rebuilds the
+    # editor from the frame below - carrying the amounts over but with the
+    # percentages put right. Without that, Streamlit would keep re-applying
+    # the stale cells it remembers.
+    sharer_ids = [int(r.id) for r in sharers.itertuples()]
+    previous = st.session_state.get(k(f"rows_{kind}"))
+    if previous is None:
+        previous = [{"Amount": None, "Sharing": "Ratio"} for _ in range(3)]
+
+    rows = []
+    for row in previous:
+        mode = SHARE_GRID_LABELS.get(row.get("Sharing") or "Ratio", "ratio")
+        typed = {pid: row.get(pct_columns[pid]) for pid in sharer_ids}
+        shown = effective_pct(mode, cash_partner_id, typed, partners, kind,
+                              sharer_ids)
+        rows.append({
+            "Amount": row.get("Amount"),
+            "Sharing": row.get("Sharing") or "Ratio",
+            **{pct_columns[pid]: shown[pid] for pid in sharer_ids},
+        })
+    blank = pd.DataFrame(rows)
+
+    # A readable, deterministic fingerprint - "RCN" for Ratio, Custom, Not
+    # shared - rather than hash(), whose value is salted per process.
+    fingerprint = "".join(str(r["Sharing"])[0] for r in rows) or "0"
+    edited = st.data_editor(
+        blank, key=k(f"grid_{kind}_{fingerprint}"),
+        num_rows="dynamic", width="stretch",
+        column_config={
+            "Amount": st.column_config.NumberColumn(
+                "Amount", format="%.2f", step=100.0,
+                help="Negative is allowed on expenses only, for a refund."),
+            "Sharing": st.column_config.SelectboxColumn(
+                "Sharing", options=list(SHARE_GRID_LABELS), required=True,
+                width="medium"),
+            **{col: st.column_config.NumberColumn(col, format="%.2f",
+                                                  min_value=0.0, max_value=100.0,
+                                                  step=5.0)
+               for col in pct_columns.values()},
+        },
+    )
+
+    # Build the lines, collecting complaints rather than stopping at the first:
+    # it is quicker to fix a grid once than to be told about one row at a time.
+    lines, problems = [], []
+    st.session_state[k(f"rows_{kind}")] = edited.to_dict("records")
+
+    # records, not itertuples: a column called "Deepa %" is not a valid
+    # attribute name, so itertuples would rename it and the percentages would
+    # silently read as zero.
+    for position, row in enumerate(edited.to_dict("records"), start=1):
+        raw = row.get("Amount")
+        if raw is None or pd.isna(raw) or float(raw) == 0:
+            continue
+        amount = float(raw)
+        mode = SHARE_GRID_LABELS.get(row.get("Sharing", "Ratio"), "ratio")
+        split = {}
+        if mode == "custom":
+            split = {pid: float(row.get(col) or 0.0)
+                     for pid, col in pct_columns.items()}
+        if amount < 0 and kind != "expense":
+            problems.append(f"Row {position}: only expenses can be negative.")
+            continue
+        if mode == "custom" and abs(sum(split.values()) - 100.0) > 0.01:
+            problems.append(
+                f"Row {position}: custom split totals {sum(split.values()):g}%"
+                " — it must be 100%.")
+            continue
+        lines.append({
+            "entry_date": entry_date, "kind": kind, "amount": amount,
+            "currency": currency, "category": category,
+            "description": description, "cash_partner_id": int(cash_partner_id),
+            "share_mode": mode, "custom_split": split or None,
+        })
+
+    for message in problems:
+        st.warning(message)
+
+    if lines:
+        total = sum(line["amount"] for line in lines)
+        borne: dict[int, float] = {}
+        for line in lines:
+            for pid, pct in db.resolve_split(
+                    line["share_mode"], line["cash_partner_id"],
+                    line["custom_split"], partners, kind=kind).items():
+                borne[pid] = borne.get(pid, 0.0) + line["amount"] * pct / 100
+        verb = "bears" if kind == "expense" else "earns"
+        st.info(
+            f"**{len(lines)} {'line' if len(lines) == 1 else 'lines'}** · total "
+            f"{money(total, currency)}  ·  "
+            + "   ".join(f"**{names.get(pid, pid)}** {verb} "
+                         f"{money(value, currency)}"
+                         for pid, value in borne.items())
+        )
+
+    if lines:
+        # The authoritative statement of what is about to be written. Whatever
+        # the grid cells say, this is computed from the same resolve_split the
+        # save uses, so the two cannot disagree.
+        breakdown = []
+        for position, line in enumerate(lines, start=1):
+            applied = db.resolve_split(
+                line["share_mode"], line["cash_partner_id"],
+                line["custom_split"], partners, kind=kind)
+            breakdown.append({
+                "Line": position,
+                "Amount": line["amount"],
+                "Sharing": next(label for label, mode
+                                in SHARE_GRID_LABELS.items()
+                                if mode == line["share_mode"]),
+                **{names.get(pid, str(pid)): line["amount"] * pct / 100
+                   for pid, pct in applied.items()},
+            })
+        with st.expander(f"What will be saved — {len(breakdown)} "
+                         f"{'line' if len(breakdown) == 1 else 'lines'}",
+                         expanded=True):
+            frame = pd.DataFrame(breakdown)
+            st.dataframe(
+                frame, hide_index=True, width="stretch",
+                column_config={c: st.column_config.NumberColumn(c, format="%.2f")
+                               for c in frame.columns if c not in ("Line", "Sharing")},
+            )
+
+    if st.button(f"➕ Add {len(lines) or ''} "
+                 f"{'entry' if len(lines) == 1 else 'entries'}".replace("  ", " "),
+                 type="primary", key=k("save"), disabled=not lines):
+        try:
+            saved = db.save_entries(lines)
+            flash(f"Saved {len(saved)} entries · total "
+                  f"{money(sum(line['amount'] for line in lines), currency)} "
+                  f"({category}).")
+            bump("multi")
+            st.rerun()
+        except ValueError as exc:
+            st.error(str(exc))
+
+
+# --------------------------------------------------------------------------- #
 # ledger table builder
 # --------------------------------------------------------------------------- #
 def ledger_table(entries: pd.DataFrame, splits: pd.DataFrame,
@@ -539,7 +769,17 @@ if off_ratios:
 # --------------------------------------------------------------------------- #
 with tab_add:
     st.subheader("Record an expense or income")
-    payload = entry_editor("new", partners)
+    if st.toggle(
+        "Several amounts at once",
+        key="new_multi_mode",
+        help="One row per amount, all sharing the date, category, description, "
+             "partner and currency. Each row keeps its own sharing choice and "
+             "is saved as its own entry.",
+    ):
+        multi_entry_form(partners)
+        payload = None
+    else:
+        payload = entry_editor("new", partners)
     if payload:
         try:
             db.save_entry(**payload)
