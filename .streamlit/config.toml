@@ -9,4 +9,7 @@ maxUploadSize = 50
 gatherUsageStats = false
 
 [theme]
-base = "light"
+# base is deliberately NOT set. Pinning it to "light" forced light mode on
+# everyone and disabled Streamlit's own theme switcher. Left unset, the app
+# follows the reader's system preference and the choice they make under
+# ☰ > Settings > Theme (Light / Dark / Use system setting).

@@ -1421,6 +1421,20 @@ with tab_bs:
 # tab: setup
 # --------------------------------------------------------------------------- #
 with tab_setup:
+    st.subheader("Appearance")
+    # Streamlit owns the theme - there is no API to set it from the script, so
+    # the switcher in its own menu is the only real control. All this does is
+    # say where it lives and what is currently in force, because the menu is
+    # easy to miss.
+    current = (st.context.theme or {}).get("type") or "system"
+    st.caption(
+        f"This screen is in **{current}** mode. To change it, open the "
+        "**☰ menu** at the top right → **Settings** → **Theme**, and pick "
+        "*Light*, *Dark* or *Use system setting*. The choice is remembered in "
+        "your browser, so each of you can have it your own way."
+    )
+
+    st.divider()
     st.subheader("Business")
     g1, g2 = st.columns(2)
     with g1:
